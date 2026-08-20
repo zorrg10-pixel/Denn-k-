@@ -1,0 +1,176 @@
+name: Build Knižnica Reader APK (PR)
+
+on:
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Prepare Android app
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE/kniznica-reader/android-app"
+          rm -rf "$ROOT"
+          mkdir -p "$ROOT/app/src/main/java/sk/kniznica/reader" "$ROOT/app/src/main/assets" "$ROOT/app/src/main/res/drawable"
+
+          cat "$GITHUB_WORKSPACE"/kniznica-reader/source/index.b64.* | base64 -d > "$ROOT/app/src/main/assets/index.html"
+          curl --fail --location --retry 3 https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js -o "$ROOT/app/src/main/assets/pdf.min.js"
+          curl --fail --location --retry 3 https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js -o "$ROOT/app/src/main/assets/pdf.worker.min.js"
+
+          cat > "$ROOT/settings.gradle" <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = 'KniznicaReader'
+          include ':app'
+          EOF
+
+          cat > "$ROOT/build.gradle" <<'EOF'
+          plugins { id 'com.android.application' version '8.7.3' apply false }
+          EOF
+
+          cat > "$ROOT/app/build.gradle" <<'EOF'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'sk.kniznica.reader'
+              compileSdk 35
+              defaultConfig {
+                  applicationId 'sk.kniznica.reader'
+                  minSdk 23
+                  targetSdk 35
+                  versionCode 1
+                  versionName '1.0'
+              }
+              buildTypes {
+                  debug { debuggable false; minifyEnabled false }
+              }
+          }
+          EOF
+
+          cat > "$ROOT/app/src/main/AndroidManifest.xml" <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <application android:allowBackup="true" android:hardwareAccelerated="true" android:icon="@drawable/app_icon" android:label="Knižnica Reader" android:supportsRtl="true" android:theme="@android:style/Theme.Material.Light.NoActionBar">
+              <activity android:name=".MainActivity" android:configChanges="orientation|screenSize|keyboardHidden" android:exported="true">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN" />
+                  <category android:name="android.intent.category.LAUNCHER" />
+                </intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF
+
+          cat > "$ROOT/app/src/main/res/drawable/app_icon.xml" <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+            <path android:fillColor="#EF3A64" android:pathData="M0,0h108v108h-108z"/>
+            <path android:fillColor="#FFFFFF" android:pathData="M27,24h22c8,0 13,4 16,8c3,-4 8,-8 16,-8h0v59h-20c-6,0 -10,2 -12,5c-2,-3 -6,-5 -12,-5h-10zM33,32v43h8c6,0 10,1 13,4v-38c-2,-6 -6,-9 -13,-9zM75,32c-7,0 -11,3 -13,9v38c3,-3 7,-4 13,-4h0z"/>
+          </vector>
+          EOF
+
+          cat > "$ROOT/app/src/main/java/sk/kniznica/reader/MainActivity.java" <<'EOF'
+          package sk.kniznica.reader;
+
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.content.Intent;
+          import android.graphics.Color;
+          import android.net.Uri;
+          import android.view.View;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+
+          public class MainActivity extends Activity {
+            private static final int FILE_CHOOSER_REQUEST = 7001;
+            private WebView webView;
+            private ValueCallback<Uri[]> fileCallback;
+
+            @Override protected void onCreate(Bundle savedInstanceState) {
+              super.onCreate(savedInstanceState);
+              getWindow().setStatusBarColor(Color.rgb(238,58,100));
+              getWindow().setNavigationBarColor(Color.WHITE);
+              if (android.os.Build.VERSION.SDK_INT >= 26) getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
+              webView = new WebView(this);
+              webView.setBackgroundColor(Color.rgb(247,247,249));
+              setContentView(webView);
+              WebSettings s = webView.getSettings();
+              s.setJavaScriptEnabled(true); s.setDomStorageEnabled(true); s.setDatabaseEnabled(true);
+              s.setAllowFileAccess(true); s.setAllowContentAccess(true); s.setSupportZoom(false);
+              s.setBuiltInZoomControls(false); s.setDisplayZoomControls(false);
+              s.setAllowFileAccessFromFileURLs(true); s.setAllowUniversalAccessFromFileURLs(true);
+              webView.setWebViewClient(new WebViewClient());
+              webView.setWebChromeClient(new WebChromeClient(){
+                @Override public boolean onShowFileChooser(WebView v, ValueCallback<Uri[]> cb, FileChooserParams p){
+                  if(fileCallback!=null) fileCallback.onReceiveValue(null);
+                  fileCallback=cb;
+                  try { startActivityForResult(p.createIntent(), FILE_CHOOSER_REQUEST); return true; }
+                  catch(Exception e){ fileCallback=null; return false; }
+                }
+              });
+              webView.loadUrl("file:///android_asset/index.html");
+            }
+
+            @Override protected void onActivityResult(int requestCode,int resultCode,Intent data){
+              super.onActivityResult(requestCode,resultCode,data);
+              if(requestCode==FILE_CHOOSER_REQUEST && fileCallback!=null){
+                fileCallback.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(resultCode,data)); fileCallback=null;
+              }
+            }
+
+            @Override public void onBackPressed(){
+              String js="(function(){var p=document.getElementById('pdfReader');if(p&&p.classList.contains('show')){document.getElementById('closePdf').click();return 'handled';}var r=document.getElementById('reader');if(r&&r.classList.contains('show')){document.getElementById('closeReader').click();return 'handled';}var o=document.querySelector('.overlay.show');if(o){o.classList.remove('show');return 'handled';}var d=document.getElementById('drawer');if(d&&d.classList.contains('show')){document.getElementById('drawerBackdrop').click();return 'handled';}var k=document.getElementById('knowledgePage');if(k&&k.classList.contains('active')){document.getElementById('backFromKnowledge').click();return 'handled';}return 'fallback';})()";
+              webView.evaluateJavascript(js,value->{ if(value!=null&&value.contains("handled")) return; if(webView.canGoBack()) webView.goBack(); else super.onBackPressed(); });
+            }
+          }
+          EOF
+
+      - name: Install Android SDK 35
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+
+      - name: Build APK
+        working-directory: kniznica-reader/android-app
+        run: gradle --no-daemon assembleDebug
+
+      - name: Verify and rename APK
+        shell: bash
+        run: |
+          APK="$GITHUB_WORKSPACE/kniznica-reader/android-app/app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$APK"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$APK"
+          cp "$APK" "$GITHUB_WORKSPACE/Kniznica-Reader-v1.0.apk"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kniznica-Reader-v1.0
+          path: Kniznica-Reader-v1.0.apk
+          if-no-files-found: error
